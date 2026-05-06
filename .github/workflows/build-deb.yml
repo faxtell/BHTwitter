@@ -1,7 +1,29 @@
-name: Build deb
+name: Build deb and branded IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      patch_ipa:
+        description: "Also patch a decrypted Twitter/X IPA branding"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+      ipa_url:
+        description: "Optional direct URL to your decrypted Twitter/X IPA. Can also use repository secret TWITTER_IPA_URL."
+        required: false
+        type: string
+      branding_assets_zip_url:
+        description: "Optional ZIP URL containing twitter_app_icon.png, twitter_logo.png, twitter_launch_logo.png. Can also use repository secret BRANDING_ASSETS_ZIP_URL."
+        required: false
+        type: string
+      display_name:
+        description: "Home-screen app name when patch_ipa=true"
+        required: true
+        type: string
+        default: "Twitter"
   push:
     branches:
       - master
@@ -10,9 +32,14 @@ permissions:
   contents: read
 
 jobs:
-  build-deb:
-    name: Build sideload deb
+  build:
+    name: Build deb and optional branded IPA
     runs-on: macos-14
+
+    env:
+      DISPLAY_NAME: ${{ github.event.inputs.display_name || 'Twitter' }}
+      INPUT_IPA_URL: ${{ github.event.inputs.ipa_url || secrets.TWITTER_IPA_URL }}
+      INPUT_BRANDING_ASSETS_ZIP_URL: ${{ github.event.inputs.branding_assets_zip_url || secrets.BRANDING_ASSETS_ZIP_URL }}
 
     steps:
       - name: Checkout
@@ -32,19 +59,113 @@ jobs:
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
 
-      - name: Build deb only
+      - name: Prepare optional branding assets
+        run: |
+          set -euo pipefail
+          BRANDING_DIR="layout/Library/Application Support/BHT/BHTwitter.bundle/Branding"
+          mkdir -p "$BRANDING_DIR"
+
+          if [[ -n "${INPUT_BRANDING_ASSETS_ZIP_URL:-}" ]]; then
+            echo "[info] Downloading branding assets ZIP..."
+            curl -fL "$INPUT_BRANDING_ASSETS_ZIP_URL" -o /tmp/branding-assets.zip
+            rm -rf /tmp/branding-assets
+            mkdir -p /tmp/branding-assets
+            unzip -q /tmp/branding-assets.zip -d /tmp/branding-assets
+
+            python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import sys
+
+          source = Path('/tmp/branding-assets')
+          dest = Path('layout/Library/Application Support/BHT/BHTwitter.bundle/Branding')
+          dest.mkdir(parents=True, exist_ok=True)
+
+          wanted = [
+              'twitter_app_icon.png',
+              'twitter_logo.png',
+              'twitter_launch_logo.png',
+              'twitter_tab_logo.png',
+          ]
+
+          copied = []
+          for name in wanted:
+              matches = list(source.rglob(name))
+              if matches:
+                  shutil.copy2(matches[0], dest / name)
+                  copied.append(name)
+
+          if 'twitter_app_icon.png' in copied:
+              for fallback in ['twitter_logo.png', 'twitter_launch_logo.png', 'twitter_tab_logo.png']:
+                  if fallback not in copied:
+                      shutil.copy2(dest / 'twitter_app_icon.png', dest / fallback)
+                      copied.append(fallback)
+
+          print('[info] Branding assets copied:', ', '.join(copied) if copied else 'none')
+          PY
+          else
+            echo "[info] No branding assets ZIP supplied. Runtime fallback branding will be used."
+          fi
+
+          echo "[info] Branding directory contents:"
+          find "$BRANDING_DIR" -maxdepth 1 -type f -print || true
+
+      - name: Build sideload deb
         run: |
           set -euo pipefail
           make clean || true
           rm -rf .theos packages
           unset THEOS_PACKAGE_SCHEME
           make package SIDELOADED=1 FINALPACKAGE=1
-          echo "Built packages:"
+          echo "Built deb packages:"
           ls -lah packages/*.deb
+
+      - name: Patch IPA branding
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.patch_ipa == 'true' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${INPUT_IPA_URL:-}" ]]; then
+            echo "[error] patch_ipa=true requires ipa_url input or TWITTER_IPA_URL repository secret." >&2
+            exit 1
+          fi
+
+          mkdir -p packages
+          curl -fL "$INPUT_IPA_URL" -o packages/input-twitter.ipa
+
+          ARGS=(
+            --input packages/input-twitter.ipa
+            --output packages/Twitter-branded.ipa
+            --display-name "${DISPLAY_NAME:-Twitter}"
+          )
+
+          BRANDING_DIR="layout/Library/Application Support/BHT/BHTwitter.bundle/Branding"
+          if [[ -f "$BRANDING_DIR/twitter_app_icon.png" ]]; then
+            ARGS+=(--icon "$BRANDING_DIR/twitter_app_icon.png")
+          else
+            echo "[warn] twitter_app_icon.png not found. Home-screen icon will not be changed."
+          fi
+
+          if [[ -f "$BRANDING_DIR/twitter_launch_logo.png" ]]; then
+            ARGS+=(--launch-logo "$BRANDING_DIR/twitter_launch_logo.png")
+          else
+            echo "[warn] twitter_launch_logo.png not found. Real LaunchScreen will not be changed."
+          fi
+
+          python3 tools/patch_ipa_branding.py "${ARGS[@]}"
+          ls -lah packages/Twitter-branded.ipa
 
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: BHTwitter-sideloaded-deb
           path: packages/*.deb
+          if-no-files-found: error
+
+      - name: Upload branded IPA artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.patch_ipa == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Twitter-branded-unsigned-ipa
+          path: packages/Twitter-branded.ipa
           if-no-files-found: error
