@@ -1,0 +1,50 @@
+name: Build deb
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-deb:
+    name: Build sideload deb
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install make dpkg ldid xz
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build deb only
+        run: |
+          set -euo pipefail
+          make clean || true
+          rm -rf .theos packages
+          unset THEOS_PACKAGE_SCHEME
+          make package SIDELOADED=1 FINALPACKAGE=1
+          echo "Built packages:"
+          ls -lah packages/*.deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BHTwitter-sideloaded-deb
+          path: packages/*.deb
+          if-no-files-found: error
